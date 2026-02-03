@@ -1,0 +1,21 @@
+# Python cache
+__pycache__/
+*.pyc
+
+# Conda / virtual env
+.env
+.venv/
+env/
+semantic-harq/
+
+# Data (do NOT upload datasets)
+data/raw/
+data/processed/
+
+# IDE
+.idea/
+.vscode/
+
+# OS
+.DS_Store
+Thumbs.db

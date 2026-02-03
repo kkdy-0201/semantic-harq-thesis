@@ -1,0 +1,12 @@
+name: semantic-harq
+channels:
+  - defaults
+  - conda-forge
+dependencies:
+  - python=3.9
+  - numpy
+  - matplotlib
+  - scipy
+  - pip
+  - pip:
+      - tqdm
