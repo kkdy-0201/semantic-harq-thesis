@@ -1,5 +1,10 @@
 # main.py
+import os
+os.environ["KMP_DUPLICATE_LIB_OK"] = "TRUE"
+
 import torch
+import matplotlib.pyplot as plt
+
 from torch.utils.data import DataLoader
 
 from torchvision import datasets, transforms
@@ -13,14 +18,14 @@ from utils.metrics import accuracy
 def main():
     device = "cuda" if torch.cuda.is_available() else "cpu"
 
-    # ===== CIFAR10 图像输入 =====
+    # CIFAR10 图像输入
     tfm = transforms.Compose([
         transforms.ToTensor(),
     ])
     ds = datasets.CIFAR10(root="./data/raw", train=False, download=True, transform=tfm)
     dl = DataLoader(ds, batch_size=128, shuffle=False, num_workers=0)
 
-    # ===== 系统超参 =====
+    # 系统超参
     semantic_dim = 128
     num_blocks = 8
     num_classes = 10
@@ -38,7 +43,7 @@ def main():
         snr_map_b=-2.0
     )
 
-    # ===== 模块 =====
+    # 模块
     encoder = ImageSemanticEncoder(semantic_dim).to(device)
     decoder = SemanticDecoder(semantic_dim).to(device)
     task_head = TaskHead(semantic_dim, num_classes).to(device)
@@ -48,7 +53,7 @@ def main():
     tx = Sender(encoder=encoder, num_blocks=num_blocks).to(device)
     rx = Receiver(decoder=decoder, soft_combiner=soft_combiner, task_head=task_head, cfg=cfg_rx).to(device)
 
-    # ===== 预运行 =====
+    # 预运行
     encoder.eval(); decoder.eval(); task_head.eval(); soft_combiner.eval()
 
     img, y = next(iter(dl))
@@ -59,6 +64,20 @@ def main():
 
     out = rx.run_harq(x_tx, xb_tx)
     logits = out["logits_final"]
+   # 显示图像
+    pred = logits.argmax(dim=1)
+
+   # 显示一张输入图像  系统预测结果
+    img_np = img[0].permute(1, 2, 0).cpu().numpy()
+
+    plt.figure(figsize=(3, 3))
+    plt.imshow(img_np)
+    plt.title(f"GT: {y[0].item()}, Pred: {pred[0].item()}")
+    plt.axis("off")
+    plt.show()
+
+    print("GT label:", y[0].item())
+    print("Pred label:", pred[0].item())
 
     print("=== System Run OK ===")
     print("Batch acc (untrained, just sanity):", accuracy(logits, y))
