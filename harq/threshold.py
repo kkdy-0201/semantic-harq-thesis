@@ -1,91 +1,96 @@
-# harq/threshold.py
+import math
 from dataclasses import dataclass
+
 import torch
-import torch.nn as nn
 
-def split_blocks(x: torch.Tensor, num_blocks: int) -> torch.Tensor:
-    B, D = x.shape
-    assert D % num_blocks == 0, "semantic_dim must be divisible by num_blocks"
-    return x.view(B, num_blocks, D // num_blocks)
-
-def merge_blocks(xb: torch.Tensor) -> torch.Tensor:
-    B, nb, bd = xb.shape
-    return xb.reshape(B, nb * bd)
-
-def reliability_from_snr_db(snr_db_blocks: torch.Tensor, alpha: float = 0.6, mid_db: float = 0.0) -> torch.Tensor:
+def split_blocks(z: torch.Tensor, num_blocks: int):
     """
-    单调映射：SNR越高可靠度越大
-    snr_db_blocks: [B, nb]
+    z: [B, D]
+    return: [B, K, block_dim]
     """
-    return torch.sigmoid(alpha * (snr_db_blocks - mid_db))
+    B, D = z.shape
+    assert D % num_blocks == 0, f"semantic_dim={D} 必须能被 num_blocks={num_blocks} 整除"
+    bd = D // num_blocks
+    return z.view(B, num_blocks, bd)
 
-def integrated_gradients_blockwise(task_model: nn.Module,
-                                   z_from: torch.Tensor,
-                                   z_to: torch.Tensor,
-                                   target_idx: torch.Tensor,
-                                   num_blocks: int,
-                                   steps: int = 16) -> torch.Tensor:
+def merge_blocks(zb: torch.Tensor):
     """
-    Block-wise Integrated Gradients attribution from z_from -> z_to.
-    返回每个块的贡献度（非负）。
+    zb: [B, K, block_dim]
+    return: [B, D]
     """
-    assert z_from.shape == z_to.shape
-    B, D = z_from.shape
-    delta = (z_to - z_from).detach()
-    grads_acc = torch.zeros_like(z_from)
+    B, K, bd = zb.shape
+    return zb.reshape(B, K * bd)
 
-    for i in range(1, steps + 1):
-        alpha = i / steps
-        z = (z_from + alpha * delta).detach().requires_grad_(True)
-        logits = task_model(z)  # [B,C]
-        f = logits.gather(1, target_idx.view(-1, 1)).sum()
-        g = torch.autograd.grad(f, z, retain_graph=False, create_graph=False)[0]
-        grads_acc += g.detach()
+def reliability_from_snr_db(snr_db_tensor: torch.Tensor):
+    return torch.sigmoid((snr_db_tensor - 0.0) / 3.0)
 
-    avg_grads = grads_acc / steps
-    attr = (delta * avg_grads).abs()                      # [B,D]
-    contrib = split_blocks(attr, num_blocks).sum(dim=-1)  # [B,nb]
+def integrated_gradients_blockwise(
+    task_head,
+    decoder,
+    z_prev: torch.Tensor,
+    z_candidate: torch.Tensor,
+    target_class: torch.Tensor,
+    num_blocks: int,
+    steps: int = 16,
+):
+    """
+    计算从 z_prev -> z_candidate 的 block-level integrated gradients importance
+    返回: [B, num_blocks]
+    """
+    device = z_prev.device
+    B, D = z_prev.shape
+    alphas = torch.linspace(0.0, 1.0, steps, device=device)
+
+    total_grads = torch.zeros_like(z_prev)
+
+    for a in alphas:
+        z_interp = z_prev + a * (z_candidate - z_prev)
+        z_interp.requires_grad_(True)
+
+        feat = decoder(z_interp)
+        logits = task_head(feat)
+
+        score = logits.gather(1, target_class.view(-1, 1)).sum()
+        grads = torch.autograd.grad(score, z_interp, retain_graph=False, create_graph=False)[0]
+        total_grads += grads.detach()
+
+    avg_grads = total_grads / float(steps)
+    ig = (z_candidate - z_prev) * avg_grads   # [B, D]
+
+    ig_blocks = split_blocks(ig, num_blocks)  # [B, K, bd]
+    contrib = ig_blocks.abs().sum(dim=-1)     # [B, K]
     return contrib
+
 
 @dataclass
 class BlockSelectorConfig:
-    num_blocks: int
-    topk: int
-    ig_steps: int = 16
-    rel_alpha: float = 0.6
-    rel_mid_db: float = 0.0
+    alpha: float = 1.0   # 不可靠度权重
+    beta: float = 1.0    # 贡献度权重
+    topk: int = 4
+
 
 class BlockSelector:
-    """
-    value = reliability(SNR) * contribution(IG)
-    """
     def __init__(self, cfg: BlockSelectorConfig):
         self.cfg = cfg
 
-    def score(self,
-              task_model: nn.Module,
-              z_prev: torch.Tensor,
-              z_new: torch.Tensor,
-              logits_new: torch.Tensor,
-              snr_db_blocks: torch.Tensor) -> torch.Tensor:
-        with torch.enable_grad():
-            target = logits_new.detach().argmax(dim=1)  # [B]
-            contrib = integrated_gradients_blockwise(
-                task_model=task_model,
-                z_from=z_prev,
-                z_to=z_new,
-                target_idx=target,
-                num_blocks=self.cfg.num_blocks,
-                steps=self.cfg.ig_steps
-            )
-        rel = reliability_from_snr_db(snr_db_blocks, self.cfg.rel_alpha, self.cfg.rel_mid_db)
-        return rel * contrib
+    def score_blocks(self, contrib: torch.Tensor, snr_block_db: torch.Tensor):
+        """
+        contrib: [B, K]  块贡献
+        snr_block_db: [B, K]  块累计SNR(dB)
+        """
+        reliability = reliability_from_snr_db(snr_block_db).clamp(1e-6, 1.0 - 1e-6)
+        deficiency = 1.0 - reliability
 
-    @torch.no_grad()
-    def select_topk_mask(self, value: torch.Tensor) -> torch.Tensor:
-        B, nb = value.shape
-        k = min(self.cfg.topk, nb)
-        idx = torch.topk(value, k=k, dim=1).indices
-        mask = torch.zeros_like(value, dtype=torch.bool)
-        mask.scatter_(1, idx, True)
-        return mask
+        score = (deficiency ** self.cfg.alpha) * (contrib.clamp_min(1e-8) ** self.cfg.beta)
+        return score
+
+    def select(self, contrib: torch.Tensor, snr_block_db: torch.Tensor):
+        """
+        返回:
+            topk_idx: [B, topk]
+            score: [B, K]
+        """
+        score = self.score_blocks(contrib, snr_block_db)
+        topk = min(self.cfg.topk, score.shape[1])
+        topk_idx = torch.topk(score, k=topk, dim=1).indices
+        return topk_idx, score

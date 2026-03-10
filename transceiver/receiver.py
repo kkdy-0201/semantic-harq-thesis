@@ -1,118 +1,170 @@
-# transceiver/receiver.py
 from dataclasses import dataclass
+
 import torch
 import torch.nn as nn
 
-from channel.awgn import awgn
-from utils.metrics import softmax_entropy
-from harq.threshold import merge_blocks, BlockSelector, BlockSelectorConfig
+from channel.semantic_channel import semantic_channel_real
+from harq.threshold import (
+    split_blocks,
+    merge_blocks,
+    integrated_gradients_blockwise,
+    BlockSelector,
+    BlockSelectorConfig,
+)
+
 
 @dataclass
 class ReceiverConfig:
-    semantic_dim: int
-    num_blocks: int
-    num_classes: int
-    entropy_target: float
-    max_rounds: int
-    snr_db: float
-    topk: int
-    ig_steps: int
+    semantic_dim: int = 128
+    num_blocks: int = 8
+    num_classes: int = 10
 
-    # 熵 -> 所需SNR (dB) 的简单标定（可替换为查表/拟合）
+    # HARQ
+    max_rounds: int = 4
+    min_rounds: int = 1
+    topk: int = 4
+    ig_steps: int = 16
+
+    # 停止阈值
+    entropy_target: float = 0.65
+    entropy_hysteresis: float = 0.05
+    confidence_target: float = 0.70
+
+    # 块选择打分
+    select_alpha: float = 1.0
+    select_beta: float = 1.0
+
+    # 信道
+    snr_db: float = 10.0
+    pt: float = 1.0
+    eps: float = 1e-8
+
+    # 保留原来的映射参数
     snr_map_a: float = 6.0
     snr_map_b: float = -2.0
 
+
 class Receiver(nn.Module):
-    def __init__(self, decoder: nn.Module, soft_combiner: nn.Module, task_head: nn.Module, cfg: ReceiverConfig):
+    def __init__(self, decoder, soft_combiner, task_head, cfg: ReceiverConfig):
         super().__init__()
         self.decoder = decoder
         self.soft_combiner = soft_combiner
         self.task_head = task_head
         self.cfg = cfg
 
-        self.selector = BlockSelector(BlockSelectorConfig(
-            num_blocks=cfg.num_blocks,
-            topk=cfg.topk,
-            ig_steps=cfg.ig_steps
-        ))
+        self.selector = BlockSelector(
+            BlockSelectorConfig(
+                alpha=cfg.select_alpha,
+                beta=cfg.select_beta,
+                topk=cfg.topk,
+            )
+        )
 
-    def _snr_lin(self, snr_db: float) -> float:
-        return 10.0 ** (snr_db / 10.0)
+    def entropy_from_logits(self, logits: torch.Tensor):
+        p = torch.softmax(logits, dim=1)
+        ent = -(p * torch.log(p.clamp_min(1e-8))).sum(dim=1)
+        conf = p.max(dim=1).values
+        pred = p.argmax(dim=1)
+        return ent, conf, pred
 
-    def snr_required_db(self, entropy: torch.Tensor) -> torch.Tensor:
-        # 简单线性映射：熵越大需要更高SNR
-        return self.cfg.snr_map_a * entropy + self.cfg.snr_map_b
+    def should_stop(self, entropy, confidence, rounds_used):
+
+        enough_rounds = rounds_used >= self.cfg.min_rounds
+        entropy_ok = entropy <= (self.cfg.entropy_target - self.cfg.entropy_hysteresis)
+        conf_ok = confidence >= self.cfg.confidence_target
+        return enough_rounds & entropy_ok & conf_ok
 
     def run_harq(self, x_tx: torch.Tensor, xb_tx: torch.Tensor):
         device = x_tx.device
         B, D = x_tx.shape
-        nb = self.cfg.num_blocks
+        K = self.cfg.num_blocks
 
-        snr_lin_per_tx = self._snr_lin(self.cfg.snr_db)
-
-        # per-block 累计SNR（线性叠加）
-        snr_acc_lin = torch.full((B, nb), snr_lin_per_tx, device=device)
-        snr_acc_db = 10.0 * torch.log10(torch.clamp(snr_acc_lin, min=1e-12))
-
-        # round 0: 全量发送一次
-        y0 = awgn(x_tx, self.cfg.snr_db, assume_unit_power=True)
-        z_old = self.decoder(y0)
+        # 第1轮：全量发送
+        y0 = semantic_channel_real(
+            x_tx, snr_db=self.cfg.snr_db, pt=self.cfg.pt, eps=self.cfg.eps
+        )
+        z_cur = y0
 
         rounds_used = torch.ones(B, device=device)
+        block_rounds = torch.ones(B, K, device=device)   # 每块已接收轮数
         blocks_retx_total = torch.zeros(B, device=device)
 
-        for r in range(1, self.cfg.max_rounds + 1):
-            logits_old = self.task_head(z_old)
-            ent = softmax_entropy(logits_old)  # [B]
-            snr_eff_db_global = snr_acc_db.mean(dim=1)  # [B]
+        logits = self.task_head(self.decoder(z_cur))
+        entropy, confidence, pred_class = self.entropy_from_logits(logits)
 
-            # 触发判据（更严谨版本）：熵>目标 且 当前SNR低于“熵映射的所需SNR”
-            if r == self.cfg.max_rounds:
-                decision = torch.zeros_like(ent, dtype=torch.bool)
-            else:
-                snr_req = self.snr_required_db(ent)
-                decision = (ent > self.cfg.entropy_target) & (snr_eff_db_global < snr_req)
+        done = self.should_stop(entropy, confidence, rounds_used)
 
-            if not decision.any():
+        # 后续重传
+        for r in range(2, self.cfg.max_rounds + 1):
+            if bool(done.all()):
                 break
 
-            # 用“全量重传候选更新”评估IG贡献（用于块选择）
-            with torch.no_grad():
-                y_full = awgn(x_tx, self.cfg.snr_db, assume_unit_power=True)
-                z_inc_full = self.decoder(y_full)
-                z_cand = self.soft_combiner(z_old, z_inc_full, snr_eff_db_global)
+            # 当前 z 分块
+            zb_cur = split_blocks(z_cur, K)
 
-            value = self.selector.score(
-                task_model=self.task_head,
-                z_prev=z_old,
-                z_new=z_cand,
-                logits_new=self.task_head(z_cand).detach(),
-                snr_db_blocks=snr_acc_db
+            # 假设所有块若再收一轮的候选版本
+            y_candidate_full = semantic_channel_real(
+                x_tx, snr_db=self.cfg.snr_db, pt=self.cfg.pt, eps=self.cfg.eps
             )
-            mask = self.selector.select_topk_mask(value)      # [B,nb]
-            mask = mask & decision.view(-1, 1)               # 仅对需要重传的样本生效
+            zb_candidate_full = split_blocks(y_candidate_full, K)
 
-            blocks_retx_total += mask.float().sum(dim=1)
-            rounds_used[decision] = r + 1
+            # 计算 block-wise IG 贡献
+            contrib = integrated_gradients_blockwise(
+                task_head=self.task_head,
+                decoder=self.decoder,
+                z_prev=z_cur,
+                z_candidate=y_candidate_full,
+                target_class=pred_class,
+                num_blocks=K,
+                steps=self.cfg.ig_steps,
+            )
 
-            # 只重传 top-k 块
-            xb_retx = xb_tx.clone()
-            xb_retx[~mask] = 0.0
-            x_retx = merge_blocks(xb_retx)
+            # 当前每块累计SNR
+            gamma = 10.0 ** (self.cfg.snr_db / 10.0)
+            gamma_blk = block_rounds * gamma
+            snr_block_db = 10.0 * torch.log10(gamma_blk.clamp_min(1e-8))
 
-            y = awgn(x_retx, self.cfg.snr_db, assume_unit_power=True)
-            z_inc = self.decoder(y)
+            # 块选择
+            topk_idx, score = self.selector.select(contrib, snr_block_db)
 
-            # 更新累计SNR（仅对重传块）
-            snr_acc_lin = snr_acc_lin + mask.float() * snr_lin_per_tx
-            snr_acc_db = 10.0 * torch.log10(torch.clamp(snr_acc_lin, min=1e-12))
+            # 对未完成样本执行重传
+            for b in range(B):
+                if done[b]:
+                    continue
 
-            # 软合并更新
-            z_old = self.soft_combiner(z_old, z_inc, snr_eff_db_global)
+                idx = topk_idx[b]  # [topk]
 
-        logits_final = self.task_head(z_old)
-        return {
-            "logits_final": logits_final,
+                # 仅对选中的块加一轮新观测
+                block_new_obs = semantic_channel_real(
+                    xb_tx[b:b+1, idx, :],
+                    snr_db=self.cfg.snr_db,
+                    pt=self.cfg.pt,
+                    eps=self.cfg.eps,
+                )  # [1, topk, bd]
+
+                # 软合并：仅更新这些块
+                old_blocks = zb_cur[b:b+1, idx, :]
+                new_blocks = self.soft_combiner(old_blocks, block_new_obs)
+
+                zb_cur[b:b+1, idx, :] = new_blocks
+                block_rounds[b, idx] += 1.0
+                blocks_retx_total[b] += float(idx.numel())
+
+            z_cur = merge_blocks(zb_cur)
+
+            rounds_used = torch.where(done, rounds_used, torch.full_like(rounds_used, float(r)))
+
+            logits = self.task_head(self.decoder(z_cur))
+            entropy, confidence, pred_class = self.entropy_from_logits(logits)
+
+            done = done | self.should_stop(entropy, confidence, rounds_used)
+
+        out = {
+            "z_final": z_cur,
+            "logits_final": logits,
+            "entropy_final": entropy,
+            "confidence_final": confidence,
             "rounds_used": rounds_used,
-            "blocks_retx_total": blocks_retx_total
+            "blocks_retx_total": blocks_retx_total,
         }
+        return out

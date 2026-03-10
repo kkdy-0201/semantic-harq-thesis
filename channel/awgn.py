@@ -1,4 +1,4 @@
-# channel/awgn.py
+#防bug，无用文件
 import torch
 
 def awgn(x: torch.Tensor, snr_db: float, assume_unit_power: bool = True) -> torch.Tensor:
