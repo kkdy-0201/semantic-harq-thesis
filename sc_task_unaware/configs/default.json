@@ -4,9 +4,8 @@
 
   "dataset": {
     "name": "CIFAR10",
-    "root": "./data/raw",
-    "download": true,
-    "num_classes": 10
+    "root": "../data/raw",
+    "download": true
   },
 
   "channel": {
@@ -21,13 +20,22 @@
   "sc_model": {
     "in_channels": 3,
     "base_channels": 64,
-    "latent_channels": 16
+    "latent_channels": 256
   },
 
   "loss": {
-    "name": "mse",
-    "lambda_l1": 1.0,
-    "lambda_msssim": 0.2
+    "rec_mode": "mse",
+    "lambda_rec": 1.0,
+    "lambda_stru": 0.15
+  },
+
+  "structure_model": {
+    "name": "dinov2_vits14",
+    "img_size": 224,
+    "feat_distance": "l1",
+    "layer_ids": [3, 7, 11],
+    "layer_weights": [0.25, 0.35, 0.40],
+    "normalize_feats": true
   },
 
   "train_sc": {
@@ -39,21 +47,10 @@
     "save_dir": "./checkpoints_sc"
   },
 
-  "downstream": {
-    "model_name": "resnet50",
-    "pretrained": true,
-    "epochs": 30,
-    "batch_size": 128,
-    "lr": 0.0001,
-    "weight_decay": 1e-5,
-    "num_workers": 0,
-    "save_dir": "./checkpoints_downstream"
-  },
-
   "eval": {
     "batch_size": 128,
     "num_workers": 0,
     "snrs": [-5, 0, 5, 10, 15, 20],
-    "save_dir": "./figures_sc_cls"
+    "save_dir": "./eval_outputs"
   }
 }

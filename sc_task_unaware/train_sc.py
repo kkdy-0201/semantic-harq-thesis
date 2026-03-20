@@ -9,9 +9,10 @@ from torch.utils.data import DataLoader
 from torchvision import datasets, transforms
 
 from utils.config import load_config, set_seed, ensure_dir, get_device
-from models.sc_cnn import SCEncoder, SCDecoder
+from models.sc_unet import SCUNetEncoder, SCUNetDecoder
+from models.ssl_backbone import FrozenDINOv2FeatureExtractor
 from channel.semantic_channel import semantic_channel_real, sample_snr_db
-from losses.reconstruction import ReconstructionLoss, psnr
+from losses.reconstruction import CompositeSCLoss, psnr
 
 
 @torch.no_grad()
@@ -26,14 +27,14 @@ def evaluate_sc(encoder, decoder, dl, device, channel_cfg):
         x = x.to(device)
         snr_db = float(channel_cfg["snr_db"])
 
-        z = encoder(x)
+        z, skips = encoder(x)
         z_noisy = semantic_channel_real(
             z,
             snr_db=snr_db,
             pt=float(channel_cfg["pt"]),
-            eps=float(channel_cfg["eps"]),
+            eps=float(channel_cfg["eps"])
         )
-        x_hat = decoder(z_noisy)
+        x_hat = decoder(z_noisy, skips)
 
         psnr_sum += psnr(x_hat, x)
         n += 1
@@ -50,9 +51,10 @@ def main():
     set_seed(int(cfg["seed"]))
     device = get_device(cfg)
 
-    train_cfg = cfg["train_sc"]
     data_cfg = cfg["dataset"]
     model_cfg = cfg["sc_model"]
+    stru_cfg = cfg["structure_model"]
+    train_cfg = cfg["train_sc"]
     channel_cfg = cfg["channel"]
 
     ensure_dir(train_cfg["save_dir"])
@@ -71,13 +73,13 @@ def main():
         root=data_cfg["root"],
         train=True,
         download=bool(data_cfg["download"]),
-        transform=tfm_train,
+        transform=tfm_train
     )
     ds_test = datasets.CIFAR10(
         root=data_cfg["root"],
         train=False,
         download=bool(data_cfg["download"]),
-        transform=tfm_test,
+        transform=tfm_test
     )
 
     dl_train = DataLoader(
@@ -85,33 +87,40 @@ def main():
         batch_size=int(train_cfg["batch_size"]),
         shuffle=True,
         num_workers=int(train_cfg["num_workers"]),
-        pin_memory=(device == "cuda"),
+        pin_memory=(device == "cuda")
     )
     dl_test = DataLoader(
         ds_test,
         batch_size=int(train_cfg["batch_size"]),
         shuffle=False,
         num_workers=int(train_cfg["num_workers"]),
-        pin_memory=(device == "cuda"),
+        pin_memory=(device == "cuda")
     )
 
-    encoder = SCEncoder(
+    encoder = SCUNetEncoder(
         in_channels=int(model_cfg["in_channels"]),
         base_channels=int(model_cfg["base_channels"]),
-        latent_channels=int(model_cfg["latent_channels"]),
+        latent_channels=int(model_cfg["latent_channels"])
     ).to(device)
 
-    decoder = SCDecoder(
+    decoder = SCUNetDecoder(
         out_channels=int(model_cfg["in_channels"]),
         base_channels=int(model_cfg["base_channels"]),
-        latent_channels=int(model_cfg["latent_channels"]),
+        latent_channels=int(model_cfg["latent_channels"])
     ).to(device)
 
-    criterion = ReconstructionLoss(cfg)
+    # 冻结的自监督视觉 backbone，用于结构 loss
+    structure_extractor = FrozenDINOv2FeatureExtractor(
+        model_name=stru_cfg["name"],
+        img_size=int(stru_cfg["img_size"])
+    ).to(device)
+
+    criterion = CompositeSCLoss(cfg, structure_extractor)
+
     optimizer = optim.Adam(
         list(encoder.parameters()) + list(decoder.parameters()),
         lr=float(train_cfg["lr"]),
-        weight_decay=float(train_cfg["weight_decay"]),
+        weight_decay=float(train_cfg["weight_decay"])
     )
     scheduler = optim.lr_scheduler.CosineAnnealingLR(
         optimizer, T_max=int(train_cfg["epochs"])
@@ -125,6 +134,8 @@ def main():
         decoder.train()
 
         loss_sum = 0.0
+        rec_sum = 0.0
+        stru_sum = 0.0
         steps = 0
 
         for x, _ in dl_train:
@@ -133,28 +144,33 @@ def main():
 
             optimizer.zero_grad(set_to_none=True)
 
-            z = encoder(x)
+            z, skips = encoder(x)
             z_noisy = semantic_channel_real(
                 z,
                 snr_db=snr_db,
                 pt=float(channel_cfg["pt"]),
-                eps=float(channel_cfg["eps"]),
+                eps=float(channel_cfg["eps"])
             )
-            x_hat = decoder(z_noisy)
+            x_hat = decoder(z_noisy, skips)
 
             loss, stats = criterion(x_hat, x)
             loss.backward()
             optimizer.step()
 
-            loss_sum += float(loss.item())
+            loss_sum += stats["loss_total"]
+            rec_sum += stats["loss_rec"]
+            stru_sum += stats["loss_stru"]
             steps += 1
 
         scheduler.step()
+
         test_psnr = evaluate_sc(encoder, decoder, dl_test, device, channel_cfg)
 
         print(
             f"[Epoch {ep:03d}/{train_cfg['epochs']}] "
-            f"train_loss={loss_sum / max(steps,1):.6f} "
+            f"loss={loss_sum / max(steps,1):.6f} "
+            f"rec={rec_sum / max(steps,1):.6f} "
+            f"stru={stru_sum / max(steps,1):.6f} "
             f"test_psnr@{channel_cfg['snr_db']}dB={test_psnr:.3f}"
         )
 
